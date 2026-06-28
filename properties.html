@@ -31,7 +31,7 @@
     <nav class="sidebar-nav">
       <ul>
         <li class="nav-item" data-page="dashboard">
-          <a href="index.html" class="nav-link">
+          <a href="admin-dashboard.html" class="nav-link">
             <span class="nav-icon">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/></svg>
             </span>
@@ -178,6 +178,7 @@
             <option value="Sold">Sold</option>
             <option value="Let / Rented">Let / Rented</option>
             <option value="Withdrawn">Withdrawn</option>
+            <option value="Archived">Archived</option>
           </select>
           <select id="purposeFilter" class="filter-select">
             <option value="all">All Purposes</option>
@@ -207,9 +208,10 @@
             <option value="Draft">Draft</option>
             <option value="Under Offer">Under Offer</option>
             <option value="Withdrawn">Withdrawn</option>
+            <option value="Archived">Archived</option>
           </select>
           <button class="action-btn outline small" id="btnBulkStatus">Apply</button>
-          <button class="action-btn danger small" id="btnBulkDelete">Delete Selected</button>
+          <button class="action-btn danger small" id="btnBulkDelete">Archive Selected</button>
         </div>
       </div>
 
@@ -418,7 +420,7 @@
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
             <p class="drop-title">Drag &amp; drop images here</p>
             <p class="drop-sub">or click to browse</p>
-            <input type="file" id="imageFileInput" accept="image/*" multiple hidden />
+            <input type="file" id="imageFileInput" accept=".jpg,.jpeg,.png,.webp" multiple hidden />
             <button type="button" class="action-btn outline small" id="btnBrowseImages">Browse Images</button>
           </div>
           <p class="upload-note">
@@ -436,7 +438,7 @@
           <div class="form-section-label">Property Documents</div>
           <div class="doc-note-box">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
-            <p><strong>Note:</strong> Document storage will be connected to secure backend storage in a later phase. This area is a frontend prototype only.</p>
+            <p><strong>Note:</strong> Documents upload to private Supabase Storage. Secure signed downloads will be improved in a later phase.</p>
           </div>
 
           <div class="doc-upload-list">
@@ -445,11 +447,11 @@
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
                 <div>
                   <p class="doc-type">Floor Plan</p>
-                  <p class="doc-hint">PDF, PNG, or JPG</p>
+                  <p class="doc-hint">PDF, JPG, PNG, or WebP</p>
                 </div>
               </div>
               <label class="doc-upload-btn">
-                <input type="file" accept=".pdf,.png,.jpg,.jpeg" hidden id="docFloorPlan" />
+                <input type="file" accept=".pdf,.png,.jpg,.jpeg,.webp" hidden id="docFloorPlan" />
                 <span id="docFloorPlanName">Choose file</span>
               </label>
             </div>
@@ -484,11 +486,11 @@
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
                 <div>
                   <p class="doc-type">Other Document</p>
-                  <p class="doc-hint">PDF, DOC, or DOCX</p>
+                  <p class="doc-hint">PDF, JPG, PNG, or WebP</p>
                 </div>
               </div>
               <label class="doc-upload-btn">
-                <input type="file" accept=".pdf,.doc,.docx" hidden id="docOther" />
+                <input type="file" accept=".pdf,.png,.jpg,.jpeg,.webp" hidden id="docOther" />
                 <span id="docOtherName">Choose file</span>
               </label>
             </div>
@@ -537,6 +539,7 @@
                 <option value="Sold">Sold</option>
                 <option value="Let / Rented">Let / Rented</option>
                 <option value="Withdrawn">Withdrawn</option>
+                <option value="Archived">Archived</option>
               </select>
             </div>
           </div>
@@ -550,6 +553,7 @@
               <li><span class="badge badge-sold">Sold</span> Sale completed. Moved to archive.</li>
               <li><span class="badge badge-let">Let / Rented</span> Rental completed. Moved to archive.</li>
               <li><span class="badge badge-withdrawn">Withdrawn</span> Removed from market. Not visible.</li>
+              <li><span class="badge badge-withdrawn">Archived</span> Kept for audit history. Not visible.</li>
             </ul>
           </div>
         </div><!-- end tab-status -->

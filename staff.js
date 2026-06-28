@@ -568,6 +568,32 @@ function getBranchPayloadFromForm() {
   };
 }
 
+async function logActivity(entry) {
+  var supabase = getSupabaseClient();
+  if (!supabase) return;
+
+  try {
+    var payload = {
+      action_type: entry.actionType,
+      description: entry.description,
+      branch_id: entry.branchId || null,
+      property_id: entry.propertyId || null,
+      lead_id: entry.leadId || null,
+      staff_user_id: (window.hilltopCurrentUser || {}).id || null
+    };
+
+    var response = await supabase
+      .from('activity_logs')
+      .insert(payload);
+
+    if (response.error) {
+      console.warn('Activity log insert failed.', response.error);
+    }
+  } catch (error) {
+    console.warn('Activity log insert failed.', error);
+  }
+}
+
 async function createStaffProfile(payload) {
   var response = await getSupabaseClient()
     .from('staff_users')
@@ -579,6 +605,8 @@ async function createStaffProfile(payload) {
     console.warn('Supabase staff insert failed.', response.error);
     throw new Error(response.error.message || 'Unable to create staff profile.');
   }
+
+  return response.data.id;
 }
 
 async function updateStaffProfile(staffId, payload) {
@@ -593,6 +621,8 @@ async function updateStaffProfile(staffId, payload) {
     console.warn('Supabase staff update failed.', response.error);
     throw new Error(response.error.message || 'Unable to update staff profile.');
   }
+
+  return response.data.id;
 }
 
 async function updateStaffActiveStatus(staffId, isActive) {
@@ -607,6 +637,8 @@ async function updateStaffActiveStatus(staffId, isActive) {
     console.warn('Supabase staff status update failed.', response.error);
     throw new Error(response.error.message || 'Unable to update staff status.');
   }
+
+  return response.data.id;
 }
 
 async function createBranch(payload) {
@@ -620,6 +652,8 @@ async function createBranch(payload) {
     console.warn('Supabase branch insert failed.', response.error);
     throw new Error(response.error.message || 'Unable to create branch.');
   }
+
+  return response.data.id;
 }
 
 async function updateBranch(branchId, payload) {
@@ -634,6 +668,8 @@ async function updateBranch(branchId, payload) {
     console.warn('Supabase branch update failed.', response.error);
     throw new Error(response.error.message || 'Unable to update branch.');
   }
+
+  return response.data.id;
 }
 
 
@@ -1336,9 +1372,19 @@ staffForm.addEventListener('submit', async function(e) {
 
     if (editId) {
       await updateStaffProfile(editId, payload);
+      await logActivity({
+        actionType: 'STAFF_UPDATED',
+        description: 'Updated staff profile for ' + payload.full_name + '.',
+        branchId: payload.branch_id || null
+      });
       showToast('Staff profile updated.', 'success');
     } else {
       await createStaffProfile(payload);
+      await logActivity({
+        actionType: 'STAFF_CREATED',
+        description: 'Created staff profile for ' + payload.full_name + '.',
+        branchId: payload.branch_id || null
+      });
       showToast('Staff profile created. Create the login account in Supabase Auth and link auth_user_id when ready.', 'success');
     }
 
@@ -1379,6 +1425,11 @@ async function toggleStaffStatus(id) {
 
   try {
     await updateStaffActiveStatus(id, newStatus === 'Active');
+    await logActivity({
+      actionType: newStatus === 'Active' ? 'STAFF_ACTIVATED' : 'STAFF_DEACTIVATED',
+      description: (newStatus === 'Active' ? 'Activated' : 'Deactivated') + ' staff profile for ' + staff.name + '.',
+      branchId: staff.branchId || null
+    });
     showToast(newStatus === 'Active' ? 'Staff account activated.' : 'Staff account deactivated.', 'success');
     await loadStaffModuleData();
   } catch (error) {
@@ -1408,6 +1459,11 @@ async function deleteStaff(id) {
 
   try {
     await updateStaffActiveStatus(id, false);
+    await logActivity({
+      actionType: 'STAFF_DEACTIVATED',
+      description: 'Deactivated staff profile for ' + staff.name + '.',
+      branchId: staff.branchId || null
+    });
     if (String(activePanelStaffId) === String(id)) closeStaffDetailsPanel();
     showToast('Staff profile deactivated instead of deleted for audit safety.', 'success');
     await loadStaffModuleData();
@@ -1445,9 +1501,19 @@ branchForm.addEventListener('submit', async function(e) {
 
     if (editId) {
       await updateBranch(editId, payload);
+      await logActivity({
+        actionType: 'BRANCH_UPDATED',
+        description: 'Updated branch ' + payload.name + '.',
+        branchId: editId
+      });
       showToast('Branch updated.', 'success');
     } else {
-      await createBranch(payload);
+      var createdBranchId = await createBranch(payload);
+      await logActivity({
+        actionType: 'BRANCH_CREATED',
+        description: 'Created branch ' + payload.name + '.',
+        branchId: createdBranchId
+      });
       showToast('Branch created.', 'success');
     }
 

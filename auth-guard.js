@@ -10,7 +10,7 @@
 
   function currentPageName() {
     var path = window.location.pathname || '';
-    return path.split('/').pop() || 'index.html';
+    return path.split('/').pop() || 'admin-dashboard.html';
   }
 
   function redirectToLogin(reason) {

@@ -125,11 +125,6 @@ using (true)
 with check (true);
 
 drop policy if exists "Authenticated users can delete properties" on public.properties;
-create policy "Authenticated users can delete properties"
-on public.properties
-for delete
-to authenticated
-using (true);
 
 drop policy if exists "Authenticated users can insert property images" on public.property_images;
 create policy "Authenticated users can insert property images"
@@ -147,11 +142,6 @@ using (true)
 with check (true);
 
 drop policy if exists "Authenticated users can delete property images" on public.property_images;
-create policy "Authenticated users can delete property images"
-on public.property_images
-for delete
-to authenticated
-using (true);
 
 drop policy if exists "Authenticated users can insert property documents" on public.property_documents;
 create policy "Authenticated users can insert property documents"
@@ -169,11 +159,6 @@ using (true)
 with check (true);
 
 drop policy if exists "Authenticated users can delete property documents" on public.property_documents;
-create policy "Authenticated users can delete property documents"
-on public.property_documents
-for delete
-to authenticated
-using (true);
 
 drop policy if exists "Authenticated users can insert leads" on public.leads;
 create policy "Authenticated users can insert leads"
@@ -191,11 +176,6 @@ using (true)
 with check (true);
 
 drop policy if exists "Authenticated users can delete leads" on public.leads;
-create policy "Authenticated users can delete leads"
-on public.leads
-for delete
-to authenticated
-using (true);
 
 drop policy if exists "Authenticated users can insert activity logs" on public.activity_logs;
 create policy "Authenticated users can insert activity logs"

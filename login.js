@@ -54,7 +54,7 @@
     try {
       var result = await supabaseClient.auth.getSession();
       if (result.data && result.data.session) {
-        window.location.href = 'index.html';
+        window.location.href = 'admin-dashboard.html';
       }
     } catch (error) {
       console.info('Unable to check existing session.', error);
@@ -103,7 +103,7 @@
         return;
       }
 
-      window.location.href = 'index.html';
+      window.location.href = 'admin-dashboard.html';
     } catch (error) {
       showError('Unable to reach Supabase. Check your internet connection, Supabase project URL, and make sure you are using Live Server.');
     } finally {

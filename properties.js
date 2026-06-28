@@ -3,7 +3,7 @@
    properties.js
    Phase 3A: read-only Supabase loading.
    Phase 3B will add property create/update/archive safely.
-   Phase 3C will add property images/documents storage.
+   Phase 3C: property images/documents storage.
    ============================================================ */
 
 
@@ -211,6 +211,12 @@ var nextId = 11;
 
 // Track which images are staged for the current modal session
 var stagedImages = [];
+var IMAGE_BUCKET = 'property-images';
+var DOCUMENT_BUCKET = 'property-documents';
+var MAX_IMAGE_SIZE = 5 * 1024 * 1024;
+var MAX_DOCUMENT_SIZE = 10 * 1024 * 1024;
+var ALLOWED_IMAGE_TYPES = ['image/jpeg', 'image/png', 'image/webp'];
+var ALLOWED_DOCUMENT_TYPES = ['application/pdf', 'image/jpeg', 'image/png', 'image/webp'];
 
 
 /* ══════════════════════════════════════════════════════════════
@@ -270,7 +276,7 @@ var propertyStaff = [];
    4. SUPABASE READ-ONLY LOADING
    Phase 3A: read-only Supabase loading.
    Phase 3B will add property create/update/archive safely.
-   Phase 3C will add property images/documents storage.
+   Phase 3C: property images/documents storage.
 ══════════════════════════════════════════════════════════════ */
 
 function getSupabaseClient() {
@@ -340,6 +346,38 @@ function requirePropertyManagePermission(property) {
   return false;
 }
 
+function requireMediaUploadPermission(property) {
+  if (canManageProperty(property)) return true;
+  showToast('You do not have permission to upload media for this property.', 'error');
+  return false;
+}
+
+async function logActivity(entry) {
+  var supabase = getSupabaseClient();
+  if (!supabase) return;
+
+  try {
+    var payload = {
+      action_type: entry.actionType,
+      description: entry.description,
+      branch_id: entry.branchId || null,
+      property_id: entry.propertyId || null,
+      lead_id: entry.leadId || null,
+      staff_user_id: (window.hilltopCurrentUser || {}).id || null
+    };
+
+    var response = await supabase
+      .from('activity_logs')
+      .insert(payload);
+
+    if (response.error) {
+      console.warn('Activity log insert failed.', response.error);
+    }
+  } catch (error) {
+    console.warn('Activity log insert failed.', error);
+  }
+}
+
 function formatPrice(price, purpose) {
   var numericPrice = Number(price || 0);
   var formatted = 'ZMW ' + numericPrice.toLocaleString('en-ZM', {
@@ -391,6 +429,61 @@ function hasPendingMediaOrDocumentFiles() {
   });
 
   return stagedImages.length > 0 || hasDocs;
+}
+
+function sanitizeFileName(fileName) {
+  return String(fileName || 'file')
+    .toLowerCase()
+    .replace(/[^a-z0-9._-]+/g, '-')
+    .replace(/-+/g, '-')
+    .replace(/^-|-$/g, '') || 'file';
+}
+
+function makeStoragePath(propertyId, folder, fileName) {
+  return 'properties/' + propertyId + '/' + folder + '/' + Date.now() + '-' + sanitizeFileName(fileName);
+}
+
+function validateImageFile(file) {
+  if (!ALLOWED_IMAGE_TYPES.includes(file.type)) {
+    throw new Error(file.name + ' is not a supported image type. Use JPG, PNG, or WebP.');
+  }
+
+  if (file.size > MAX_IMAGE_SIZE) {
+    throw new Error(file.name + ' is larger than 5MB.');
+  }
+}
+
+function validateDocumentFile(file) {
+  if (!ALLOWED_DOCUMENT_TYPES.includes(file.type)) {
+    throw new Error(file.name + ' is not a supported document type. Use PDF, JPG, PNG, or WebP.');
+  }
+
+  if (file.size > MAX_DOCUMENT_SIZE) {
+    throw new Error(file.name + ' is larger than 10MB.');
+  }
+}
+
+function getSelectedDocumentUploads() {
+  var configs = [
+    { inputId: 'docFloorPlan', type: 'Floor Plan' },
+    { inputId: 'docTitleDeed', type: 'Title Deed' },
+    { inputId: 'docLease', type: 'Lease Agreement' },
+    { inputId: 'docOther', type: 'Other' }
+  ];
+  var uploads = [];
+
+  configs.forEach(function(config) {
+    var input = document.getElementById(config.inputId);
+    if (!input || !input.files || !input.files[0]) return;
+
+    uploads.push({
+      file: input.files[0],
+      documentType: config.type,
+      documentName: input.files[0].name
+    });
+  });
+
+  return uploads;
 }
 
 function groupRowsByPropertyId(rows) {
@@ -463,17 +556,58 @@ function populatePropertyBranchSelect() {
   if (!branchSelect || propertyBranches.length === 0) return;
 
   var selectedValue = branchSelect.value;
+  var profile = window.hilltopCurrentUser || {};
   branchSelect.innerHTML = '<option value="">Select...</option>';
 
   propertyBranches.forEach(function(branch) {
     var cleanName = cleanBranchName(branch.name);
     var opt = document.createElement('option');
-    opt.value = cleanName;
+    opt.value = branch.id;
     opt.textContent = cleanName;
     branchSelect.appendChild(opt);
   });
 
+  if (isCurrentUserBranchManager() && profile.branch_id) {
+    branchSelect.value = profile.branch_id;
+    branchSelect.disabled = true;
+    return;
+  }
+
+  branchSelect.disabled = false;
   branchSelect.value = selectedValue;
+  if (selectedValue && branchSelect.value !== selectedValue) {
+    branchSelect.value = findPropertyBranchId(selectedValue) || '';
+  }
+}
+
+function populatePropertyAgentSelect() {
+  var agentSelect = document.getElementById('fAgent');
+  if (!agentSelect) return;
+
+  var selectedValue = agentSelect.value;
+  var profile = window.hilltopCurrentUser || {};
+  var selectedBranchId = isCurrentUserBranchManager()
+    ? profile.branch_id
+    : findPropertyBranchId(document.getElementById('fBranch').value);
+  agentSelect.innerHTML = '<option value="">Unassigned</option>';
+
+  propertyStaff
+    .filter(function(staff) {
+      var role = staff.role;
+      var canBeAssigned = role === 'agent' || role === 'branch_manager' || role === 'Agent' || role === 'Branch Manager';
+      var isActive = staff.is_active !== false;
+      var inManagerBranch = !isCurrentUserBranchManager() || String(staff.branch_id) === String(profile.branch_id);
+      var inSelectedBranch = !selectedBranchId || String(staff.branch_id) === String(selectedBranchId);
+      return canBeAssigned && isActive && inManagerBranch && inSelectedBranch;
+    })
+    .forEach(function(staff) {
+      var opt = document.createElement('option');
+      opt.value = staff.id;
+      opt.textContent = staff.full_name;
+      agentSelect.appendChild(opt);
+    });
+
+  agentSelect.value = selectedValue;
 }
 
 async function loadBranchesForProperties() {
@@ -492,7 +626,7 @@ async function loadBranchesForProperties() {
 async function loadStaffForProperties() {
   var response = await getSupabaseClient()
     .from('staff_users')
-    .select('id, full_name, role, branch_id')
+    .select('id, full_name, role, branch_id, is_active')
     .order('full_name', { ascending: true });
 
   if (response.error) {
@@ -575,6 +709,7 @@ async function loadPropertyModuleData() {
     staffRows.forEach(function(staff) {
       staffLookup[String(staff.id)] = staff;
     });
+    propertyStaff = staffRows;
 
     var imagesByProperty = groupRowsByPropertyId(imageRows);
     var documentsByProperty = groupRowsByPropertyId(documentRows);
@@ -602,6 +737,221 @@ async function loadPropertyModuleData() {
     showToast(error.message || 'Unable to load properties from Supabase. Showing development sample data.', 'error');
     renderProperties();
   }
+}
+
+function getPropertyPayloadFromForm() {
+  var title = document.getElementById('fTitle').value.trim();
+  var referenceNumber = document.getElementById('fRef').value.trim();
+  var price = parsePrice(document.getElementById('fPrice').value);
+  var purpose = document.getElementById('fPurpose').value;
+  var propertyType = document.getElementById('fType').value;
+  var branchId = getCurrentBranchIdForWrite(document.getElementById('fBranch').value);
+  var status = document.getElementById('fStatus').value;
+  var assignedAgentId = document.getElementById('fAgent') ? document.getElementById('fAgent').value : '';
+
+  if (!title) throw new Error('Property title is required.');
+  if (!referenceNumber) throw new Error('Reference number is required.');
+  if (!price) throw new Error('Price is required.');
+  if (!purpose) throw new Error('Purpose is required.');
+  if (!propertyType) throw new Error('Property type is required.');
+  if (!branchId) throw new Error('Branch is required.');
+  if (!document.getElementById('fArea').value.trim()) throw new Error('Area is required.');
+  if (!status) throw new Error('Status is required.');
+
+  return {
+    reference_number: referenceNumber,
+    title: title,
+    description: document.getElementById('fDesc').value.trim() || null,
+    price: price,
+    purpose: purpose,
+    property_type: propertyType,
+    branch_id: branchId,
+    area: document.getElementById('fArea').value.trim(),
+    full_address: document.getElementById('fAddress').value.trim() || null,
+    bedrooms: parseInt(document.getElementById('fBeds').value, 10) || 0,
+    bathrooms: parseInt(document.getElementById('fBaths').value, 10) || 0,
+    garages: parseInt(document.getElementById('fGarages').value, 10) || 0,
+    square_metres: parseInt(document.getElementById('fSize').value, 10) || 0,
+    status: status,
+    featured: document.getElementById('fFeatured').value === 'Yes',
+    amenities: parseAmenities(document.getElementById('fAmenities').value),
+    virtual_tour_link: document.getElementById('fVirtualTour').value.trim() || null,
+    youtube_link: document.getElementById('fYoutube').value.trim() || null,
+    assigned_agent_id: assignedAgentId || null
+  };
+}
+
+async function createProperty(payload) {
+  var response = await getSupabaseClient()
+    .from('properties')
+    .insert(payload)
+    .select('id')
+    .single();
+
+  if (response.error) {
+    console.warn('Supabase property insert failed.', response.error);
+    throw new Error(response.error.message || 'Unable to create property.');
+  }
+
+  return response.data.id;
+}
+
+async function updateProperty(propertyId, payload) {
+  var response = await getSupabaseClient()
+    .from('properties')
+    .update(payload)
+    .eq('id', propertyId)
+    .select('id')
+    .single();
+
+  if (response.error) {
+    console.warn('Supabase property update failed.', response.error);
+    throw new Error(response.error.message || 'Unable to update property.');
+  }
+
+  return response.data.id;
+}
+
+async function updatePropertyStatus(propertyId, status) {
+  var response = await getSupabaseClient()
+    .from('properties')
+    .update({ status: status })
+    .eq('id', propertyId)
+    .select('id')
+    .single();
+
+  if (response.error) {
+    console.warn('Supabase property status update failed.', response.error);
+    throw new Error(response.error.message || 'Unable to update property status.');
+  }
+}
+
+async function bulkUpdatePropertyStatus(propertyIds, status) {
+  var response = await getSupabaseClient()
+    .from('properties')
+    .update({ status: status })
+    .in('id', propertyIds);
+
+  if (response.error) {
+    console.warn('Supabase bulk property status update failed.', response.error);
+    throw new Error(response.error.message || 'Unable to update selected properties.');
+  }
+}
+
+async function insertPropertyImageMetadata(payload) {
+  var response = await getSupabaseClient()
+    .from('property_images')
+    .insert(payload);
+
+  if (response.error) {
+    console.warn('Property image metadata insert failed.', response.error);
+    throw new Error(response.error.message || 'Unable to save property image metadata.');
+  }
+}
+
+async function insertPropertyDocumentMetadata(payload) {
+  var response = await getSupabaseClient()
+    .from('property_documents')
+    .insert(payload);
+
+  if (response.error) {
+    console.warn('Property document metadata insert failed.', response.error);
+    throw new Error(response.error.message || 'Unable to save property document metadata.');
+  }
+}
+
+async function uploadPropertyImages(propertyId, property) {
+  if (!stagedImages.length) return;
+  if (!propertyId) throw new Error('A property id is required before uploading images.');
+  if (!requireMediaUploadPermission(property)) return;
+
+  showToast('Uploading property images...', 'success');
+
+  for (var i = 0; i < stagedImages.length; i += 1) {
+    var image = stagedImages[i];
+    var file = image.file;
+    validateImageFile(file);
+
+    var path = makeStoragePath(propertyId, 'images', file.name);
+    var uploadResponse = await getSupabaseClient()
+      .storage
+      .from(IMAGE_BUCKET)
+      .upload(path, file, {
+        cacheControl: '3600',
+        upsert: false,
+        contentType: file.type
+      });
+
+    if (uploadResponse.error) {
+      console.warn('Property image upload failed.', uploadResponse.error);
+      throw new Error('Image upload failed for ' + file.name + ': ' + uploadResponse.error.message);
+    }
+
+    var publicUrlResult = getSupabaseClient()
+      .storage
+      .from(IMAGE_BUCKET)
+      .getPublicUrl(path);
+
+    await insertPropertyImageMetadata({
+      property_id: propertyId,
+      image_url: publicUrlResult.data.publicUrl,
+      display_order: i,
+      is_cover: i === 0
+    });
+  }
+}
+
+async function uploadPropertyDocuments(propertyId, property) {
+  var uploads = getSelectedDocumentUploads();
+  if (!uploads.length) return;
+  if (!propertyId) throw new Error('A property id is required before uploading documents.');
+  if (!requireMediaUploadPermission(property)) return;
+
+  showToast('Uploading property documents...', 'success');
+
+  for (var i = 0; i < uploads.length; i += 1) {
+    var upload = uploads[i];
+    var file = upload.file;
+    validateDocumentFile(file);
+
+    var path = makeStoragePath(propertyId, 'documents', file.name);
+    var uploadResponse = await getSupabaseClient()
+      .storage
+      .from(DOCUMENT_BUCKET)
+      .upload(path, file, {
+        cacheControl: '3600',
+        upsert: false,
+        contentType: file.type
+      });
+
+    if (uploadResponse.error) {
+      console.warn('Property document upload failed.', uploadResponse.error);
+      throw new Error('Document upload failed for ' + file.name + ': ' + uploadResponse.error.message);
+    }
+
+    // property-documents is private, so store the storage path for now.
+    // Signed document URLs can be generated in a later secure download phase.
+    await insertPropertyDocumentMetadata({
+      property_id: propertyId,
+      document_name: upload.documentName,
+      document_type: upload.documentType,
+      document_url: path
+    });
+  }
+}
+
+async function uploadPropertyMedia(propertyId, property) {
+  if (!hasPendingMediaOrDocumentFiles()) return;
+
+  await uploadPropertyImages(propertyId, property);
+  await uploadPropertyDocuments(propertyId, property);
+  await logActivity({
+    actionType: 'PROPERTY_MEDIA_UPLOADED',
+    description: 'Uploaded media for property ' + ((property && (property.ref || property.reference_number)) || propertyId) + '.',
+    branchId: property && (property.branchId || property.branch_id),
+    propertyId: propertyId
+  });
+  showToast('Property media uploaded successfully.', 'success');
 }
 
 
@@ -646,7 +996,8 @@ function getBadgeClass(status) {
     'Under Offer': 'badge-offer',
     'Sold':        'badge-sold',
     'Let / Rented':'badge-let',
-    'Withdrawn':   'badge-withdrawn'
+    'Withdrawn':   'badge-withdrawn',
+    'Archived':    'badge-withdrawn'
   };
   return map[status] || 'badge-draft';
 }
@@ -657,6 +1008,7 @@ function getBadgeClass(status) {
  */
 function renderProperties() {
   populatePropertyBranchSelect();
+  populatePropertyAgentSelect();
   var filtered = getFilteredProperties();
 
   // Update stats from full filtered data
@@ -704,7 +1056,7 @@ function renderProperties() {
           '<button class="btn-edit" data-id="' + p.id + '" title="Edit">',
             '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M11 4H4a2 2 0 00-2 2v14a2 2 0 002 2h14a2 2 0 002-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 013 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>',
           '</button>',
-          '<button class="btn-delete" data-id="' + p.id + '" title="Delete">',
+          '<button class="btn-delete" data-id="' + p.id + '" title="Archive">',
             '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 01-2 2H8a2 2 0 01-2-2L5 6"/><path d="M10 11v6"/><path d="M14 11v6"/><path d="M9 6V4a1 1 0 011-1h4a1 1 0 011 1v2"/></svg>',
           '</button>',
         '</div>',
@@ -743,7 +1095,7 @@ function renderProperties() {
         '<div class="prop-card-price">' + p.price + '</div>',
         '<div class="prop-card-actions">',
           '<button class="action-btn outline small btn-edit" data-id="' + p.id + '">Edit</button>',
-          '<button class="action-btn danger small btn-delete" data-id="' + p.id + '">Delete</button>',
+          '<button class="action-btn danger small btn-delete" data-id="' + p.id + '">Archive</button>',
         '</div>',
       '</div>'
     ].join('');
@@ -876,14 +1228,32 @@ function viewProperty(id) {
 /**
  * Removes a property from the array and re-renders.
  */
-function deleteProperty(id) {
+async function deleteProperty(id) {
   var p = properties.find(function(x){ return String(x.id) === String(id); });
   if (!p) return;
-  if (!confirm('Remove "' + p.title + '" from this page only? Supabase archive comes in Phase 3B.')) return;
 
-  properties = properties.filter(function(x){ return String(x.id) !== String(id); });
-  renderProperties();
-  showToast(isUsingSupabaseProperties ? 'Property removed from this page only. Supabase archive comes in Phase 3B.' : 'Property deleted', 'success');
+  if (!requirePropertyManagePermission(p)) return;
+  if (!confirm('Archive "' + p.title + '" for audit safety?')) return;
+
+  try {
+    if (!getSupabaseClient()) {
+      showToast('Supabase is not available. Property archive cannot be saved.', 'error');
+      return;
+    }
+
+    await updatePropertyStatus(id, 'Archived');
+    await logActivity({
+      actionType: 'PROPERTY_ARCHIVED',
+      description: 'Archived property ' + (p.ref || p.title || id) + '.',
+      branchId: p.branchId || null,
+      propertyId: id
+    });
+    showToast('Property archived for audit safety.', 'success');
+    await loadPropertyModuleData();
+  } catch (error) {
+    console.warn('Property archive failed.', error);
+    showToast(error.message || 'Unable to archive property.', 'error');
+  }
 }
 
 
@@ -912,33 +1282,71 @@ function updateBulkCount() {
 }
 
 // Bulk status change
-btnBulkStatus.addEventListener('click', function() {
+btnBulkStatus.addEventListener('click', async function() {
   var ids = getCheckedIds();
   var newStatus = bulkStatusSelect.value;
   if (!ids.length)    { showToast('No properties selected', 'error'); return; }
   if (!newStatus)     { showToast('Please choose a status', 'error'); return; }
 
-  ids.forEach(function(id) {
-    var p = properties.find(function(x){ return String(x.id) === String(id); });
-    if (p) p.status = newStatus;
-  });
+  var selectedProperties = properties.filter(function(p) { return ids.includes(String(p.id)); });
+  var blocked = selectedProperties.some(function(p) { return !canManageProperty(p); });
+  if (blocked) {
+    showToast('You do not have permission to manage this property.', 'error');
+    return;
+  }
 
-  bulkStatusSelect.value = '';
-  selectAll.checked = false;
-  renderProperties();
-  showToast(isUsingSupabaseProperties ? 'Status updated on this page only. Supabase update comes in Phase 3B.' : 'Status updated for ' + ids.length + ' properties', 'success');
+  try {
+    if (!getSupabaseClient()) {
+      showToast('Supabase is not available. Bulk status changes cannot be saved.', 'error');
+      return;
+    }
+
+    await bulkUpdatePropertyStatus(ids, newStatus);
+    await logActivity({
+      actionType: 'PROPERTY_STATUS_UPDATED',
+      description: 'Changed status for ' + ids.length + ' properties to ' + newStatus + '.'
+    });
+    bulkStatusSelect.value = '';
+    selectAll.checked = false;
+    showToast('Status updated for ' + ids.length + ' properties', 'success');
+    await loadPropertyModuleData();
+  } catch (error) {
+    console.warn('Bulk property status update failed.', error);
+    showToast(error.message || 'Unable to update selected properties.', 'error');
+  }
 });
 
 // Bulk delete
-btnBulkDelete.addEventListener('click', function() {
+btnBulkDelete.addEventListener('click', async function() {
   var ids = getCheckedIds();
   if (!ids.length) { showToast('No properties selected', 'error'); return; }
-  if (!confirm('Remove ' + ids.length + ' selected properties from this page only? Supabase archive comes in Phase 3B.')) return;
+  if (!confirm('Archive ' + ids.length + ' selected properties for audit safety?')) return;
 
-  properties = properties.filter(function(p){ return !ids.includes(String(p.id)); });
-  selectAll.checked = false;
-  renderProperties();
-  showToast(isUsingSupabaseProperties ? ids.length + ' properties removed from this page only. Supabase archive comes in Phase 3B.' : ids.length + ' properties deleted', 'success');
+  var selectedProperties = properties.filter(function(p) { return ids.includes(String(p.id)); });
+  var blocked = selectedProperties.some(function(p) { return !canManageProperty(p); });
+  if (blocked) {
+    showToast('You do not have permission to manage this property.', 'error');
+    return;
+  }
+
+  try {
+    if (!getSupabaseClient()) {
+      showToast('Supabase is not available. Bulk archive cannot be saved.', 'error');
+      return;
+    }
+
+    await bulkUpdatePropertyStatus(ids, 'Archived');
+    await logActivity({
+      actionType: 'PROPERTY_ARCHIVED',
+      description: 'Archived ' + ids.length + ' selected properties.'
+    });
+    selectAll.checked = false;
+    showToast('Property archived for audit safety.', 'success');
+    await loadPropertyModuleData();
+  } catch (error) {
+    console.warn('Bulk property archive failed.', error);
+    showToast(error.message || 'Unable to archive selected properties.', 'error');
+  }
 });
 
 
@@ -949,16 +1357,21 @@ btnBulkDelete.addEventListener('click', function() {
 function openModal(mode, id) {
   mode = mode || 'add';
 
+  var existingProperty = id
+    ? properties.find(function(x){ return String(x.id) === String(id); })
+    : null;
+
+  if (!requirePropertyManagePermission(existingProperty)) return;
+
   // Switch to details tab first
   switchTab('details');
 
-  // Clear staged images
-  stagedImages = [];
-  imagePreviewGrid.innerHTML = '';
+  // Clear staged media for this modal session.
+  clearPropertyMediaInputs();
 
   if (mode === 'edit' && id) {
     // Find the property to edit
-    var p = properties.find(function(x){ return String(x.id) === String(id); });
+    var p = existingProperty;
     if (!p) return;
 
     modalTitle.textContent = 'Edit Property';
@@ -967,11 +1380,15 @@ function openModal(mode, id) {
     // Fill in form fields
     document.getElementById('fTitle').value    = p.title;
     document.getElementById('fRef').value      = p.ref;
-    document.getElementById('fPrice').value    = p.price;
+    document.getElementById('fPrice').value    = p.priceValue || parsePrice(p.price);
     document.getElementById('fDesc').value     = p.description;
     document.getElementById('fPurpose').value  = p.purpose;
     document.getElementById('fType').value     = p.type;
-    document.getElementById('fBranch').value   = p.branch;
+    document.getElementById('fBranch').value   = p.branchId || findPropertyBranchId(p.branch) || p.branch;
+    populatePropertyAgentSelect();
+    if (document.getElementById('fAgent')) {
+      document.getElementById('fAgent').value = p.agentId || '';
+    }
     document.getElementById('fArea').value     = p.area;
     document.getElementById('fAddress').value  = p.address;
     document.getElementById('fBeds').value     = p.beds;
@@ -991,6 +1408,10 @@ function openModal(mode, id) {
     modalTitle.textContent = 'Add New Property';
     editIdField.value = '';
     propForm.reset();
+    if (isCurrentUserBranchManager() && (window.hilltopCurrentUser || {}).branch_id) {
+      document.getElementById('fBranch').value = window.hilltopCurrentUser.branch_id;
+    }
+    populatePropertyAgentSelect();
     highlightWorkflowStep('Draft');
   }
 
@@ -1063,12 +1484,16 @@ document.getElementById('fStatus').addEventListener('change', function() {
   highlightWorkflowStep(this.value);
 });
 
+document.getElementById('fBranch').addEventListener('change', function() {
+  populatePropertyAgentSelect();
+});
+
 
 /* ══════════════════════════════════════════════════════════════
    13. FORM SAVE (ADD OR EDIT)
 ══════════════════════════════════════════════════════════════ */
 
-propForm.addEventListener('submit', function(e) {
+propForm.addEventListener('submit', async function(e) {
   e.preventDefault();
 
   // Basic validation
@@ -1090,53 +1515,66 @@ propForm.addEventListener('submit', function(e) {
     return;
   }
 
-  // Build property object from form values
-  var formData = {
-    title:       document.getElementById('fTitle').value.trim(),
-    ref:         document.getElementById('fRef').value.trim(),
-    price:       document.getElementById('fPrice').value.trim(),
-    description: document.getElementById('fDesc').value.trim(),
-    purpose:     document.getElementById('fPurpose').value,
-    type:        document.getElementById('fType').value,
-    branch:      document.getElementById('fBranch').value,
-    area:        document.getElementById('fArea').value.trim(),
-    address:     document.getElementById('fAddress').value.trim(),
-    beds:        parseInt(document.getElementById('fBeds').value) || 0,
-    baths:       parseInt(document.getElementById('fBaths').value) || 0,
-    garages:     parseInt(document.getElementById('fGarages').value) || 0,
-    size:        parseInt(document.getElementById('fSize').value) || 0,
-    featured:    document.getElementById('fFeatured').value,
-    amenities:   document.getElementById('fAmenities').value.trim(),
-    virtualTour: document.getElementById('fVirtualTour').value.trim(),
-    youtube:     document.getElementById('fYoutube').value.trim(),
-    status:      document.getElementById('fStatus').value,
-    coverImage:  stagedImages.length ? stagedImages[0] : ''
-  };
-
   var editId = editIdField.value;
+  var existingProperty = editId
+    ? properties.find(function(p){ return String(p.id) === String(editId); })
+    : null;
 
-  if (editId) {
-    // EDIT existing property in the frontend array only.
-    var idx = properties.findIndex(function(p){ return String(p.id) === String(editId); });
-    if (idx > -1) {
-      formData.id = properties[idx].id;
-      formData.branchId = properties[idx].branchId || null;
-      formData.agent = properties[idx].agent || 'Unassigned';
-      formData.agentId = properties[idx].agentId || null;
-      formData.images = properties[idx].images || [];
-      formData.documents = properties[idx].documents || [];
-      properties[idx] = formData;
-      showToast(isUsingSupabaseProperties ? 'Property updated in this page only. Supabase update comes in Phase 3B.' : 'Property updated successfully', 'success');
+  if (!requirePropertyManagePermission(existingProperty)) return;
+
+  try {
+    if (!getSupabaseClient()) {
+      showToast('Supabase is not available. Property changes cannot be saved.', 'error');
+      return;
     }
-  } else {
-    // ADD new property to the frontend array only.
-    formData.id = nextId++;
-    properties.push(formData);
-    showToast(isUsingSupabaseProperties ? 'Property added in this page only. Supabase save comes in Phase 3B.' : 'Property added successfully', 'success');
-  }
 
-  closeModal();
-  renderProperties();
+    var payload = getPropertyPayloadFromForm();
+    var savedPropertyId;
+    var mediaPermissionProperty;
+
+    if (editId) {
+      savedPropertyId = await updateProperty(editId, payload);
+      var propertyStatusChanged = existingProperty && existingProperty.status !== payload.status;
+      await logActivity({
+        actionType: propertyStatusChanged ? 'PROPERTY_STATUS_UPDATED' : 'PROPERTY_UPDATED',
+        description: propertyStatusChanged
+          ? 'Changed property ' + payload.reference_number + ' status to ' + payload.status + '.'
+          : 'Updated property ' + payload.reference_number + '.',
+        branchId: payload.branch_id,
+        propertyId: savedPropertyId
+      });
+      mediaPermissionProperty = {
+        id: savedPropertyId,
+        branchId: payload.branch_id,
+        ref: payload.reference_number
+      };
+      showToast('Property updated successfully.', 'success');
+    } else {
+      savedPropertyId = await createProperty(payload);
+      await logActivity({
+        actionType: 'PROPERTY_CREATED',
+        description: 'Created property ' + payload.reference_number + '.',
+        branchId: payload.branch_id,
+        propertyId: savedPropertyId
+      });
+      mediaPermissionProperty = {
+        id: savedPropertyId,
+        branchId: payload.branch_id,
+        ref: payload.reference_number
+      };
+      showToast('Property created successfully.', 'success');
+    }
+
+    if (hasPendingMediaOrDocumentFiles()) {
+      await uploadPropertyMedia(savedPropertyId, mediaPermissionProperty);
+    }
+
+    closeModal();
+    await loadPropertyModuleData();
+  } catch (error) {
+    console.warn('Property save failed.', error);
+    showToast(error.message || 'Unable to save property.', 'error');
+  }
 });
 
 
@@ -1183,12 +1621,20 @@ imageFileInput.addEventListener('change', function() {
  */
 function handleImageFiles(files) {
   Array.from(files).forEach(function(file) {
-    if (!file.type.startsWith('image/')) return;
+    try {
+      validateImageFile(file);
+    } catch (error) {
+      showToast(error.message, 'error');
+      return;
+    }
 
     var reader = new FileReader();
     reader.onload = function(ev) {
       var dataUrl = ev.target.result;
-      stagedImages.push(dataUrl);
+      stagedImages.push({
+        file: file,
+        previewUrl: dataUrl
+      });
       addImagePreview(dataUrl, stagedImages.length === 1);
     };
     reader.readAsDataURL(file);
@@ -1210,7 +1656,7 @@ function addImagePreview(src, isCover) {
     // Re-render all previews
     imagePreviewGrid.innerHTML = '';
     stagedImages.forEach(function(s, i) {
-      addImagePreview(s, i === 0);
+      addImagePreview(s.previewUrl, i === 0);
     });
   });
 
@@ -1220,8 +1666,7 @@ function addImagePreview(src, isCover) {
 
 /* ══════════════════════════════════════════════════════════════
    15. DOCUMENT UPLOAD — FILE NAME DISPLAY
-   Shows the selected file name next to each document upload.
-   No actual upload; this is a frontend prototype only.
+   Shows the selected file name and validates documents before upload.
 ══════════════════════════════════════════════════════════════ */
 
 function setupDocInput(inputId, nameId) {
@@ -1229,8 +1674,37 @@ function setupDocInput(inputId, nameId) {
   var nameEl = document.getElementById(nameId);
   if (!input || !nameEl) return;
   input.addEventListener('change', function() {
+    if (input.files[0]) {
+      try {
+        validateDocumentFile(input.files[0]);
+      } catch (error) {
+        input.value = '';
+        nameEl.textContent = 'Choose file';
+        showToast(error.message, 'error');
+        return;
+      }
+    }
+
     nameEl.textContent = input.files[0] ? input.files[0].name : 'Choose file';
   });
+}
+
+function resetDocumentFileLabels() {
+  ['docFloorPlanName', 'docTitleDeedName', 'docLeaseName', 'docOtherName'].forEach(function(id) {
+    var label = document.getElementById(id);
+    if (label) label.textContent = 'Choose file';
+  });
+}
+
+function clearPropertyMediaInputs() {
+  stagedImages = [];
+  imagePreviewGrid.innerHTML = '';
+  if (imageFileInput) imageFileInput.value = '';
+  ['docFloorPlan', 'docTitleDeed', 'docLease', 'docOther'].forEach(function(id) {
+    var input = document.getElementById(id);
+    if (input) input.value = '';
+  });
+  resetDocumentFileLabels();
 }
 setupDocInput('docFloorPlan',  'docFloorPlanName');
 setupDocInput('docTitleDeed',  'docTitleDeedName');

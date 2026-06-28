@@ -26,7 +26,7 @@
     <nav class="sidebar-nav">
       <ul>
         <li class="nav-item" data-page="dashboard">
-          <a href="index.html" class="nav-link">
+          <a href="admin-dashboard.html" class="nav-link">
             <span class="nav-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/></svg></span>
             <span class="nav-label">Dashboard</span>
           </a>
@@ -242,6 +242,7 @@
           <div class="settings-card-header"><h2>Property Defaults</h2><p>Standard rules for property listing quality before publishing.</p></div>
           <div class="form-grid">
             <label>Default property purpose<select id="defaultPurpose"><option>For Sale</option><option>For Rent</option></select></label>
+            <label>Default property type<select id="defaultPropertyType"><option>House</option><option>Apartment</option><option>Commercial</option><option>Land</option></select></label>
             <label>Default currency<input id="defaultCurrency" type="text" readonly /></label>
             <label>Default property status<select id="defaultPropertyStatus"><option>Draft</option><option>Active</option></select></label>
             <label>Default image placeholder text<input id="defaultImageText" type="text" /></label>
@@ -269,6 +270,8 @@
             <div><h3>Lead sources</h3><div class="pill-list" id="leadSources"></div><button type="button" class="action-btn outline small" id="btnAddSource">Add Custom Source</button></div>
           </div>
           <div class="form-grid">
+            <label>Default lead status<select id="defaultLeadStatus"><option>New</option><option>Contacted</option><option>Follow-up</option><option>Closed</option></select></label>
+            <label>Default lead source<select id="defaultLeadSource"><option>Website</option><option>WhatsApp</option><option>Phone Call</option><option>Facebook</option><option>Referral</option><option>Walk-in</option></select></label>
             <label>Default follow-up days after new enquiry<input id="defaultFollowUpDays" type="number" min="1" /></label>
             <label>Overdue warning days<input id="overdueWarningDays" type="number" min="1" /></label>
           </div>
@@ -289,10 +292,17 @@
             <div class="security-card"><h3>Role Access Preview</h3><div class="role-preview"><strong>Super Admin</strong><span>All modules and branches</span></div><div class="role-preview"><strong>Branch Manager</strong><span>Assigned branch management</span></div><div class="role-preview"><strong>Agent</strong><span>Assigned properties and leads</span></div></div>
             <div class="security-card"><h3>Security Checklist</h3><div class="check-list" id="securityChecklist"></div></div>
           </div>
+          <h3>Saved Access Configuration</h3>
+          <div class="toggle-grid">
+            <label class="toggle-row"><span>Require active staff profile</span><input id="requireActiveStaffProfile" type="checkbox" /></label>
+            <label class="toggle-row"><span>Allow agents to update lead status</span><input id="allowAgentsToUpdateLeadStatus" type="checkbox" /></label>
+            <label class="toggle-row"><span>Allow branch managers to manage own branch</span><input id="allowBranchManagersToManageOwnBranch" type="checkbox" /></label>
+          </div>
           <div class="settings-actions">
             <button type="button" class="action-btn outline" data-modal="auth">View Auth Notes</button>
             <button type="button" class="action-btn outline" data-modal="rls">View RLS Notes</button>
             <button type="button" class="action-btn primary" id="btnSafetyCheck">Run Frontend Safety Check</button>
+            <button type="button" class="action-btn primary" data-save="security">Save Security Settings</button>
           </div>
         </div>
       </section>

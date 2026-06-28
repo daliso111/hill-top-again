@@ -2,17 +2,14 @@
    HILLTOP PROPERTIES ZAMBIA — MODULE 3: CRM & LEAD MANAGEMENT
    leads.js
    ============================================================
-   All data is stored in the `leads` array below.
-   Later, this can be replaced with Supabase API calls.
-   Each function that reads/writes data is clearly marked
-   with a comment showing where Supabase would plug in.
+   Phase 4A reads leads from Supabase after auth validation.
+   Write actions remain local/frontend-only until Phase 4B/4C.
    ============================================================ */
 
 
 /* ══════════════════════════════════════════════════════════════
    1. SAMPLE LEAD DATA
-   // Later: replace this array with a Supabase fetch.
-   // Example: const { data: leads } = await supabase.from('leads').select('*');
+   Fallback demo data used only if Supabase is unavailable.
 ══════════════════════════════════════════════════════════════ */
 
 var leads = [
@@ -280,6 +277,19 @@ var currentStatus   = 'all';
 var currentSource   = 'all';
 var currentView     = 'kanban'; // 'kanban' | 'list'
 var activePanelId   = null;     // ID of the currently open details panel
+var isUsingSupabaseLeads = false;
+var leadBranches = [];
+var leadStaffUsers = [];
+var leadProperties = [];
+var branchLookupById = {};
+var staffLookupById = {};
+var propertyLookupById = {};
+var currentStaffProfile = null;
+var leadCommunicationLogsAvailable = false;
+
+var DB_ALLOWED_STATUSES = ['New', 'Contacted', 'Follow-up', 'Closed'];
+var UI_STATUSES = ['New', 'Contacted', 'Follow-up', 'Viewing Scheduled', 'Offer Made', 'Closed', 'Closed Won', 'Closed Lost'];
+var STATUS_NOTE_PREFIX = 'Frontend status selected: ';
 
 
 /* ══════════════════════════════════════════════════════════════
@@ -296,6 +306,7 @@ function getStatusBadgeClass(status) {
     'Follow-up':        'badge-followup',
     'Viewing Scheduled':'badge-viewing',
     'Offer Made':       'badge-offer',
+    'Closed':           'badge-won',
     'Closed Won':       'badge-won',
     'Closed Lost':      'badge-lost'
   };
@@ -325,7 +336,7 @@ function getKanbanColumn(status) {
   if (status === 'New') return 'New';
   if (status === 'Contacted') return 'Contacted';
   if (status === 'Follow-up' || status === 'Viewing Scheduled' || status === 'Offer Made') return 'Follow-up';
-  if (status === 'Closed Won' || status === 'Closed Lost') return 'Closed';
+  if (status === 'Closed' || status === 'Closed Won' || status === 'Closed Lost') return 'Closed';
   return 'New';
 }
 
@@ -369,6 +380,651 @@ function nowTimestamp() {
   return d.toISOString().slice(0, 16).replace('T', ' ');
 }
 
+function getSupabaseClient() {
+  return window.hilltopSupabase || null;
+}
+
+async function logActivity(entry) {
+  var supabase = getSupabaseClient();
+  if (!supabase) return;
+
+  try {
+    var payload = {
+      action_type: entry.actionType,
+      description: entry.description,
+      branch_id: entry.branchId || null,
+      property_id: entry.propertyId || null,
+      lead_id: entry.leadId || null,
+      staff_user_id: (window.hilltopCurrentUser || {}).id || null
+    };
+
+    var response = await supabase
+      .from('activity_logs')
+      .insert(payload);
+
+    if (response.error) {
+      console.warn('Activity log insert failed.', response.error);
+    }
+  } catch (error) {
+    console.warn('Activity log insert failed.', error);
+  }
+}
+
+function sameId(a, b) {
+  return String(a) === String(b);
+}
+
+function waitForCurrentStaffProfile() {
+  return new Promise(function(resolve, reject) {
+    var attempts = 0;
+    var maxAttempts = 100;
+
+    function check() {
+      if (window.hilltopCurrentUser) {
+        resolve(window.hilltopCurrentUser);
+        return;
+      }
+
+      attempts += 1;
+      if (attempts >= maxAttempts) {
+        reject(new Error('Staff profile was not loaded by auth-guard.js.'));
+        return;
+      }
+
+      setTimeout(check, 100);
+    }
+
+    check();
+  });
+}
+
+function cleanBranchName(name) {
+  return name || 'Unassigned';
+}
+
+function buildLookup(rows) {
+  var lookup = {};
+  (rows || []).forEach(function(row) {
+    lookup[String(row.id)] = row;
+  });
+  return lookup;
+}
+
+function formatPropertyLabel(property) {
+  if (!property) return 'No property specified';
+  if (property.reference_number && property.title) {
+    return property.reference_number + ' — ' + property.title;
+  }
+  return property.title || property.reference_number || 'No property specified';
+}
+
+function shouldDisplayLeadForCurrentUser(lead, profile) {
+  if (!profile) return false;
+
+  var role = getCurrentUserRole(profile);
+  if (role === 'super_admin') return true;
+  if (role === 'branch_manager') return sameId(lead.branchId, profile.branch_id);
+  if (role === 'agent') return lead.agentId ? sameId(lead.agentId, profile.id) : false;
+
+  return false;
+}
+
+function getCurrentUserRole(profile) {
+  profile = profile || currentStaffProfile || window.hilltopCurrentUser || {};
+  return String(profile.role || '').toLowerCase().replace(/\s+/g, '_');
+}
+
+function canCreateLeadForBranch(branchId) {
+  var role = getCurrentUserRole();
+  if (role === 'super_admin') return true;
+  if (role === 'branch_manager') return sameId(branchId, currentStaffProfile && currentStaffProfile.branch_id);
+  return false;
+}
+
+function canManageLead(lead) {
+  var role = getCurrentUserRole();
+  if (role === 'super_admin') return true;
+  if (role === 'branch_manager') return lead && sameId(lead.branchId, currentStaffProfile && currentStaffProfile.branch_id);
+  return false;
+}
+
+function canChangeLeadStatus(lead) {
+  var role = getCurrentUserRole();
+  if (role === 'super_admin') return true;
+  if (role === 'branch_manager') return lead && sameId(lead.branchId, currentStaffProfile && currentStaffProfile.branch_id);
+  if (role === 'agent') return lead && lead.agentId && sameId(lead.agentId, currentStaffProfile && currentStaffProfile.id);
+  return false;
+}
+
+function canAddCommunicationLog(lead) {
+  return canChangeLeadStatus(lead);
+}
+
+function mapStatusForDatabase(status) {
+  if (DB_ALLOWED_STATUSES.indexOf(status) !== -1) return status;
+  if (status === 'Viewing Scheduled' || status === 'Offer Made') return 'Follow-up';
+  if (status === 'Closed Won' || status === 'Closed Lost') return 'Closed';
+  return 'New';
+}
+
+function stripStatusNote(notes) {
+  return String(notes || '')
+    .split('\n')
+    .filter(function(line) {
+      return line.indexOf(STATUS_NOTE_PREFIX) !== 0;
+    })
+    .join('\n')
+    .trim();
+}
+
+function composeNotesForStatus(notes, status) {
+  var cleaned = stripStatusNote(notes);
+  var dbStatus = mapStatusForDatabase(status);
+  if (status && status !== dbStatus) {
+    return (cleaned ? cleaned + '\n' : '') + STATUS_NOTE_PREFIX + status;
+  }
+  return cleaned || null;
+}
+
+function getDisplayStatusFromRow(row) {
+  var notes = String(row.notes || '');
+  var line = notes.split('\n').find(function(item) {
+    return item.indexOf(STATUS_NOTE_PREFIX) === 0;
+  });
+  if (!line) return row.status || 'New';
+
+  var displayStatus = line.replace(STATUS_NOTE_PREFIX, '').trim();
+  if (UI_STATUSES.indexOf(displayStatus) === -1) return row.status || 'New';
+  if (mapStatusForDatabase(displayStatus) !== row.status) return row.status || 'New';
+  return displayStatus;
+}
+
+function normalizeTextOrNull(value) {
+  var text = String(value || '').trim();
+  return text ? text : null;
+}
+
+function getOptionLabel(selectEl, value) {
+  if (!selectEl) return '';
+  var option = Array.prototype.find.call(selectEl.options, function(item) {
+    return item.value === value;
+  });
+  return option ? option.textContent : '';
+}
+
+function getPropertyLabel(property) {
+  return formatPropertyLabel(property);
+}
+
+function resolvePropertyId(value) {
+  var text = String(value || '').trim();
+  if (!text) return null;
+
+  var found = leadProperties.find(function(property) {
+    var label = getPropertyLabel(property);
+    return sameId(property.id, text) ||
+      String(property.reference_number || '').toLowerCase() === text.toLowerCase() ||
+      String(property.title || '').toLowerCase() === text.toLowerCase() ||
+      label.toLowerCase() === text.toLowerCase();
+  });
+
+  return found ? found.id : null;
+}
+
+function resolveBranchId(value) {
+  var text = String(value || '').trim();
+  if (!text) return null;
+  if (branchLookupById[String(text)]) return text;
+
+  var found = leadBranches.find(function(branch) {
+    return String(branch.name || '').toLowerCase() === text.toLowerCase();
+  });
+  return found ? found.id : null;
+}
+
+function resolveAgentId(value) {
+  var text = String(value || '').trim();
+  if (!text) return null;
+  if (staffLookupById[String(text)]) return text;
+
+  var found = leadStaffUsers.find(function(staff) {
+    return String(staff.full_name || '').toLowerCase() === text.toLowerCase();
+  });
+  return found ? found.id : null;
+}
+
+function populateSelectOptions(selectEl, items, selectedValue, placeholder, getValue, getLabel) {
+  if (!selectEl) return;
+  selectEl.innerHTML = '';
+
+  var empty = document.createElement('option');
+  empty.value = '';
+  empty.textContent = placeholder || 'Select...';
+  selectEl.appendChild(empty);
+
+  items.forEach(function(item) {
+    var option = document.createElement('option');
+    option.value = getValue(item);
+    option.textContent = getLabel(item);
+    selectEl.appendChild(option);
+  });
+
+  if (selectedValue) selectEl.value = selectedValue;
+}
+
+function getAssignableStaff(branchId) {
+  var role = getCurrentUserRole();
+  return leadStaffUsers.filter(function(staff) {
+    var staffRole = getCurrentUserRole(staff);
+    var assignableRole = staffRole === 'agent' || staffRole === 'branch_manager';
+    if (!staff.is_active || !assignableRole) return false;
+    if (role === 'branch_manager' && !sameId(staff.branch_id, currentStaffProfile && currentStaffProfile.branch_id)) return false;
+    if (branchId && !sameId(staff.branch_id, branchId)) return false;
+    return true;
+  });
+}
+
+function getVisibleBranchesForForm() {
+  var role = getCurrentUserRole();
+  if (role === 'super_admin') return leadBranches;
+  if (role === 'branch_manager') {
+    return leadBranches.filter(function(branch) {
+      return sameId(branch.id, currentStaffProfile && currentStaffProfile.branch_id);
+    });
+  }
+  if (currentStaffProfile && currentStaffProfile.branch_id) {
+    return leadBranches.filter(function(branch) {
+      return sameId(branch.id, currentStaffProfile.branch_id);
+    });
+  }
+  return [];
+}
+
+function getVisiblePropertiesForForm(branchId) {
+  return leadProperties.filter(function(property) {
+    if (getCurrentUserRole() === 'branch_manager' && !sameId(property.branch_id, currentStaffProfile && currentStaffProfile.branch_id)) return false;
+    if (branchId && property.branch_id && !sameId(property.branch_id, branchId)) return false;
+    return true;
+  });
+}
+
+function populatePropertyDatalist(branchId) {
+  var input = document.getElementById('fProperty');
+  if (!input) return;
+
+  var datalist = document.getElementById('leadPropertyOptions');
+  if (!datalist) {
+    datalist = document.createElement('datalist');
+    datalist.id = 'leadPropertyOptions';
+    document.body.appendChild(datalist);
+    input.setAttribute('list', 'leadPropertyOptions');
+  }
+
+  datalist.innerHTML = '';
+  getVisiblePropertiesForForm(branchId).forEach(function(property) {
+    var option = document.createElement('option');
+    option.value = getPropertyLabel(property);
+    datalist.appendChild(option);
+  });
+}
+
+function populateLeadFormLookups(selectedBranchId, selectedAgentId) {
+  var branchSelect = document.getElementById('fBranch');
+  var agentSelect = document.getElementById('fAgent');
+
+  populateSelectOptions(
+    branchSelect,
+    getVisibleBranchesForForm(),
+    selectedBranchId || '',
+    'Select...',
+    function(branch) { return branch.id; },
+    function(branch) { return branch.name; }
+  );
+
+  var branchId = selectedBranchId || (branchSelect ? branchSelect.value : '');
+  populateSelectOptions(
+    agentSelect,
+    getAssignableStaff(branchId),
+    selectedAgentId || '',
+    'Unassigned',
+    function(staff) { return staff.id; },
+    function(staff) { return staff.full_name; }
+  );
+
+  populatePropertyDatalist(branchId);
+}
+
+function refreshLeadLookupControls() {
+  populateLeadFormLookups('', '');
+}
+
+function buildLeadPayloadFromForm(status) {
+  var branchId = resolveBranchId(document.getElementById('fBranch').value);
+  var agentId = resolveAgentId(document.getElementById('fAgent').value);
+  var propertyId = resolvePropertyId(document.getElementById('fProperty').value);
+
+  return {
+    client_name: document.getElementById('fName').value.trim(),
+    phone: document.getElementById('fPhone').value.trim(),
+    email: normalizeTextOrNull(document.getElementById('fEmail').value),
+    property_id: propertyId,
+    branch_id: branchId,
+    assigned_agent_id: agentId,
+    source: document.getElementById('fSource').value,
+    status: mapStatusForDatabase(status),
+    notes: composeNotesForStatus(document.getElementById('fNotes').value, status),
+    next_follow_up_date: normalizeTextOrNull(document.getElementById('fFollowupDate').value)
+  };
+}
+
+async function reloadLeadsAfterWrite(openPanelId) {
+  await loadLeadModuleData();
+  if (openPanelId) openDetailsPanel(openPanelId);
+}
+
+function isMissingCommunicationLogTableError(error) {
+  if (!error) return false;
+  var message = String(error.message || error.details || error.hint || '').toLowerCase();
+  return error.code === '42P01' ||
+    message.indexOf('lead_communication_logs') !== -1 && (
+      message.indexOf('does not exist') !== -1 ||
+      message.indexOf('not found') !== -1 ||
+      message.indexOf('schema cache') !== -1
+    );
+}
+
+function mapCommunicationLog(row, staffLookup) {
+  var staff = row.staff_user_id ? staffLookup[String(row.staff_user_id)] : null;
+  return {
+    id: row.id,
+    text: row.message || '',
+    time: row.created_at || '',
+    type: row.communication_type || 'Note',
+    staffName: staff ? staff.full_name : 'Unknown staff',
+    followupDate: row.follow_up_date || ''
+  };
+}
+
+async function loadCommunicationLogsForLeads(supabase, leadIds, staffLookup) {
+  if (!leadIds.length) {
+    leadCommunicationLogsAvailable = true;
+    return {};
+  }
+
+  var logsResult = await supabase
+    .from('lead_communication_logs')
+    .select('id, lead_id, staff_user_id, communication_type, message, follow_up_date, created_at')
+    .in('lead_id', leadIds)
+    .order('created_at', { ascending: true });
+
+  if (logsResult.error) {
+    if (isMissingCommunicationLogTableError(logsResult.error)) {
+      leadCommunicationLogsAvailable = false;
+      console.warn('Lead communication logs table not available yet. Run supabase/lead-communication-logs.sql.');
+      return {};
+    }
+    throw logsResult.error;
+  }
+
+  leadCommunicationLogsAvailable = true;
+  var logsByLead = {};
+  (logsResult.data || []).forEach(function(row) {
+    var key = String(row.lead_id);
+    if (!logsByLead[key]) logsByLead[key] = [];
+    logsByLead[key].push(mapCommunicationLog(row, staffLookup));
+  });
+
+  return logsByLead;
+}
+
+function renderCommunicationLogEntries(logs) {
+  if (!logs || logs.length === 0) {
+    return '<p style="font-size:13px;color:var(--text-light);">No log entries yet.</p>';
+  }
+
+  return logs.map(function(entry) {
+    var meta = [
+      entry.type || 'Note',
+      entry.staffName || '',
+      entry.followupDate ? 'Follow-up ' + formatDate(entry.followupDate) : ''
+    ].filter(Boolean).join(' • ');
+
+    return [
+      '<div class="comm-entry">',
+        '<div class="comm-dot"></div>',
+        '<div class="comm-content">',
+          '<div class="comm-text">' + entry.text + '</div>',
+          '<div class="comm-time">' + formatLogTime(entry.time) + (meta ? ' • ' + meta : '') + '</div>',
+        '</div>',
+      '</div>'
+    ].join('');
+  }).join('');
+}
+
+function formatLogTime(value) {
+  if (!value) return '';
+  var date = new Date(value);
+  if (Number.isNaN(date.getTime())) return value;
+  return date.toLocaleString('en-GB', {
+    day: 'numeric',
+    month: 'short',
+    year: 'numeric',
+    hour: '2-digit',
+    minute: '2-digit'
+  });
+}
+
+async function createCommunicationLog(lead, communicationType, message, followUpDate, options) {
+  options = options || {};
+
+  if (!leadCommunicationLogsAvailable) {
+    console.warn('Lead communication logs table not available yet. Run supabase/lead-communication-logs.sql.');
+    if (!options.silent) showToast('Run lead-communication-logs.sql before saving communication logs.', 'error');
+    return false;
+  }
+
+  if (!lead || !lead.id || !message || !communicationType) {
+    if (!options.silent) showToast('Please enter a communication message.', 'error');
+    return false;
+  }
+
+  if (!canAddCommunicationLog(lead)) {
+    if (!options.silent) showToast('You do not have permission to update this lead.', 'error');
+    return false;
+  }
+
+  var supabase = getSupabaseClient();
+  if (!supabase) {
+    if (!options.silent) showToast('Supabase is not available. Please refresh and try again.', 'error');
+    return false;
+  }
+
+  try {
+    var logPayload = {
+      lead_id: lead.id,
+      staff_user_id: currentStaffProfile ? currentStaffProfile.id : null,
+      communication_type: communicationType,
+      message: message,
+      follow_up_date: normalizeTextOrNull(followUpDate)
+    };
+
+    var logResult = await supabase
+      .from('lead_communication_logs')
+      .insert(logPayload);
+
+    if (logResult.error) {
+      if (isMissingCommunicationLogTableError(logResult.error)) {
+        leadCommunicationLogsAvailable = false;
+        console.warn('Lead communication logs table not available yet. Run supabase/lead-communication-logs.sql.');
+        if (!options.silent) showToast('Run lead-communication-logs.sql before saving communication logs.', 'error');
+        return false;
+      }
+      throw logResult.error;
+    }
+
+    if (followUpDate) {
+      var followupResult = await supabase
+        .from('leads')
+        .update({ next_follow_up_date: followUpDate })
+        .eq('id', lead.id);
+
+      if (followupResult.error) throw followupResult.error;
+    }
+
+    if (!options.silent) {
+      await logActivity({
+        actionType: followUpDate ? 'LEAD_FOLLOW_UP_UPDATED' : 'LEAD_COMMUNICATION_LOGGED',
+        description: followUpDate
+          ? 'Updated follow-up date for ' + lead.name + '.'
+          : 'Added communication log for ' + lead.name + '.',
+        branchId: lead.branchId || null,
+        leadId: lead.id
+      });
+    }
+
+    return true;
+  } catch (err) {
+    console.error('Communication log save failed:', err);
+    if (!options.silent) showToast('Could not save communication log. Please try again.', 'error');
+    return false;
+  }
+}
+
+function mapSupabaseLead(row, branchLookup, staffLookup, propertyLookup) {
+  var branch = row.branch_id ? branchLookup[String(row.branch_id)] : null;
+  var agent = row.assigned_agent_id ? staffLookup[String(row.assigned_agent_id)] : null;
+  var property = row.property_id ? propertyLookup[String(row.property_id)] : null;
+
+  return {
+    id: row.id,
+    name: row.client_name || 'Unnamed Lead',
+    phone: row.phone || '',
+    email: row.email || '',
+    property: formatPropertyLabel(property),
+    propertyId: row.property_id || null,
+    source: row.source || 'Website',
+    branch: cleanBranchName(branch ? branch.name : ''),
+    branchId: row.branch_id || null,
+    agent: agent ? agent.full_name : 'Unassigned',
+    agentId: row.assigned_agent_id || null,
+    status: getDisplayStatusFromRow(row),
+    dateEnquiry: row.created_at || '',
+    followupDate: row.next_follow_up_date || '',
+    followupNote: '',
+    notes: stripStatusNote(row.notes),
+    log: []
+  };
+}
+
+function ensureStatusOption(selectEl, value) {
+  if (!selectEl || !value) return;
+  var exists = Array.prototype.some.call(selectEl.options, function(option) {
+    return option.value === value;
+  });
+  if (!exists) {
+    var option = document.createElement('option');
+    option.value = value;
+    option.textContent = value;
+    selectEl.appendChild(option);
+  }
+}
+
+function ensureSupabaseStatusOptions() {
+  ensureStatusOption(statusFilter, 'Closed');
+  ensureStatusOption(document.getElementById('fStatus'), 'Closed');
+}
+
+function showLeadsLoadingState() {
+  updateStats([]);
+  if (colNew) colNew.innerHTML = '<div class="kanban-empty">Loading leads from Supabase...</div>';
+  if (colContacted) colContacted.innerHTML = '<div class="kanban-empty">Loading leads from Supabase...</div>';
+  if (colFollowup) colFollowup.innerHTML = '<div class="kanban-empty">Loading leads from Supabase...</div>';
+  if (colClosed) colClosed.innerHTML = '<div class="kanban-empty">Loading leads from Supabase...</div>';
+}
+
+async function loadLeadModuleData() {
+  ensureSupabaseStatusOptions();
+
+  var supabase = getSupabaseClient();
+  if (!supabase) {
+    console.warn('Supabase client is unavailable. Leads module is using demo data.');
+    isUsingSupabaseLeads = false;
+    renderAll();
+    return;
+  }
+
+  showLeadsLoadingState();
+
+  try {
+    var profile = await waitForCurrentStaffProfile();
+
+    var branchesResult = await supabase
+      .from('branches')
+      .select('id, name')
+      .order('name', { ascending: true });
+    if (branchesResult.error) throw branchesResult.error;
+
+    var staffResult = await supabase
+      .from('staff_users')
+      .select('id, full_name, role, branch_id, is_active')
+      .order('full_name', { ascending: true });
+    if (staffResult.error) throw staffResult.error;
+
+    var propertiesResult = await supabase
+      .from('properties')
+      .select('id, reference_number, title, branch_id')
+      .order('reference_number', { ascending: true });
+    if (propertiesResult.error) throw propertiesResult.error;
+
+    var leadsResult = await supabase
+      .from('leads')
+      .select('id, client_name, phone, email, property_id, branch_id, assigned_agent_id, source, status, notes, next_follow_up_date, created_at, updated_at')
+      .order('created_at', { ascending: false });
+    if (leadsResult.error) throw leadsResult.error;
+
+    var branchLookup = buildLookup(branchesResult.data);
+    var staffLookup = buildLookup(staffResult.data);
+    var propertyLookup = buildLookup(propertiesResult.data);
+
+    leadBranches = branchesResult.data || [];
+    leadStaffUsers = staffResult.data || [];
+    leadProperties = propertiesResult.data || [];
+    branchLookupById = branchLookup;
+    staffLookupById = staffLookup;
+    propertyLookupById = propertyLookup;
+    currentStaffProfile = profile;
+    refreshLeadLookupControls();
+
+    var mappedLeads = (leadsResult.data || []).map(function(row) {
+      return mapSupabaseLead(row, branchLookup, staffLookup, propertyLookup);
+    });
+
+    var logsByLead = await loadCommunicationLogsForLeads(
+      supabase,
+      mappedLeads.map(function(lead) { return lead.id; }),
+      staffLookup
+    );
+
+    mappedLeads.forEach(function(lead) {
+      lead.log = logsByLead[String(lead.id)] || [];
+    });
+
+    var visibleLeads = mappedLeads.filter(function(lead) {
+      return shouldDisplayLeadForCurrentUser(lead, profile);
+    });
+
+    leads = visibleLeads;
+    isUsingSupabaseLeads = true;
+    console.info('Loaded read-only leads from Supabase:', visibleLeads.length);
+    renderAll();
+  } catch (err) {
+    console.warn('Could not load leads from Supabase. Falling back to demo data.', err);
+    isUsingSupabaseLeads = false;
+    showToast('Could not load Supabase leads. Showing demo leads.', 'error');
+    renderAll();
+  }
+}
+
 
 /* ══════════════════════════════════════════════════════════════
    5. FILTER LEADS
@@ -377,15 +1033,15 @@ function nowTimestamp() {
 
 function getFilteredLeads() {
   return leads.filter(function(l) {
-    if (currentBranch !== 'all' && l.branch.toLowerCase() !== currentBranch) return false;
+    if (currentBranch !== 'all' && String(l.branch || '').toLowerCase() !== currentBranch) return false;
     if (currentStatus !== 'all' && l.status !== currentStatus) return false;
     if (currentSource !== 'all' && l.source !== currentSource) return false;
     if (currentSearch) {
       var q = currentSearch.toLowerCase();
-      var match = l.name.toLowerCase().includes(q)
-               || l.phone.toLowerCase().includes(q)
-               || l.property.toLowerCase().includes(q)
-               || l.agent.toLowerCase().includes(q);
+      var match = String(l.name || '').toLowerCase().includes(q)
+               || String(l.phone || '').toLowerCase().includes(q)
+               || String(l.property || '').toLowerCase().includes(q)
+               || String(l.agent || '').toLowerCase().includes(q);
       if (!match) return false;
     }
     return true;
@@ -405,7 +1061,7 @@ function updateStats(filtered) {
     return l.status === 'Follow-up' || l.status === 'Viewing Scheduled' || l.status === 'Offer Made';
   }).length;
   statClosed.textContent    = filtered.filter(function(l){
-    return l.status === 'Closed Won' || l.status === 'Closed Lost';
+    return l.status === 'Closed' || l.status === 'Closed Won' || l.status === 'Closed Lost';
   }).length;
 }
 
@@ -429,7 +1085,7 @@ function buildLeadCard(lead) {
   }
 
   // Status move menu options (all statuses except current)
-  var allStatuses = ['New', 'Contacted', 'Follow-up', 'Viewing Scheduled', 'Offer Made', 'Closed Won', 'Closed Lost'];
+  var allStatuses = ['New', 'Contacted', 'Follow-up', 'Viewing Scheduled', 'Offer Made', 'Closed', 'Closed Won', 'Closed Lost'];
   var menuOptions = allStatuses
     .filter(function(s){ return s !== lead.status; })
     .map(function(s){
@@ -667,21 +1323,21 @@ function handleLeadAction(e) {
 
   // View button
   if (target.closest('.btn-view')) {
-    var id = parseInt(target.closest('.btn-view').dataset.id);
+    var id = target.closest('.btn-view').dataset.id;
     openDetailsPanel(id);
     return;
   }
 
   // Edit button
   if (target.closest('.btn-edit')) {
-    var id = parseInt(target.closest('.btn-edit').dataset.id);
+    var id = target.closest('.btn-edit').dataset.id;
     openLeadModal('edit', id);
     return;
   }
 
   // Delete button
   if (target.closest('.btn-delete')) {
-    var id = parseInt(target.closest('.btn-delete').dataset.id);
+    var id = target.closest('.btn-delete').dataset.id;
     deleteLead(id);
     return;
   }
@@ -702,7 +1358,7 @@ function handleLeadAction(e) {
 
   // Status move option
   if (target.classList.contains('card-move-option')) {
-    var leadId    = parseInt(target.dataset.leadid);
+    var leadId    = target.dataset.leadid;
     var newStatus = target.dataset.newstatus;
     changeLeadStatus(leadId, newStatus);
     // Close the menu
@@ -717,7 +1373,7 @@ function handleLeadAction(e) {
       !target.closest('.card-move-menu')) {
     var card = target.closest('.lead-card');
     if (card && card.dataset.id) {
-      openDetailsPanel(parseInt(card.dataset.id));
+      openDetailsPanel(card.dataset.id);
     }
   }
 }
@@ -732,29 +1388,125 @@ document.addEventListener('click', function(e) {
 
 /* ══════════════════════════════════════════════════════════════
    15. DELETE LEAD
-   // Later: replace with Supabase delete call.
+   Phase 4B will add backend archive/delete behavior.
 ══════════════════════════════════════════════════════════════ */
 
-function deleteLead(id) {
-  var lead = leads.find(function(l){ return l.id === id; });
+async function deleteLead(id) {
+  var lead = leads.find(function(l){ return sameId(l.id, id); });
   if (!lead) return;
-  if (!confirm('Delete lead for "' + lead.name + '"? This cannot be undone.')) return;
 
-  leads = leads.filter(function(l){ return l.id !== id; });
-  if (activePanelId === id) closeDetailsPanel();
+  if (isUsingSupabaseLeads) {
+    if (!canManageLead(lead)) {
+      showToast('You do not have permission to manage this lead.', 'error');
+      return;
+    }
+
+    if (!confirm('Archive lead for "' + lead.name + '"? The row will be kept for audit safety.')) return;
+
+    var supabase = getSupabaseClient();
+    if (!supabase) {
+      showToast('Supabase is not available. Please refresh and try again.', 'error');
+      return;
+    }
+
+    try {
+      var archivedNotes = composeNotesForStatus(lead.notes, 'Closed Lost');
+      var archiveResult = await supabase
+        .from('leads')
+        .update({ status: 'Closed', notes: archivedNotes })
+        .eq('id', id);
+
+      if (archiveResult.error) throw archiveResult.error;
+
+      await logActivity({
+        actionType: 'LEAD_ARCHIVED',
+        description: 'Archived lead for ' + lead.name + '.',
+        branchId: lead.branchId || null,
+        leadId: id
+      });
+
+      if (sameId(activePanelId, id)) closeDetailsPanel();
+      await reloadLeadsAfterWrite();
+      showToast('Lead archived for audit safety.', 'success');
+    } catch (err) {
+      console.error('Lead archive failed:', err);
+      showToast('Could not archive lead. Please try again.', 'error');
+    }
+    return;
+  }
+
+  if (!confirm('Archive lead for "' + lead.name + '"?')) return;
+
+  lead.status = 'Closed Lost';
+  lead.notes = stripStatusNote(lead.notes);
+  lead.log.push({ text: 'Lead archived for audit safety.', time: nowTimestamp() });
+  if (sameId(activePanelId, id)) openDetailsPanel(id);
   renderAll();
-  showToast('Lead deleted', 'success');
+  showToast('Lead archived for audit safety.', 'success');
 }
 
 
 /* ══════════════════════════════════════════════════════════════
    16. CHANGE LEAD STATUS
-   // Later: replace with Supabase update call.
+   Phase 4B will persist backend status changes.
 ══════════════════════════════════════════════════════════════ */
 
-function changeLeadStatus(id, newStatus) {
-  var lead = leads.find(function(l){ return l.id === id; });
+async function changeLeadStatus(id, newStatus) {
+  var lead = leads.find(function(l){ return sameId(l.id, id); });
   if (!lead) return;
+
+  if (isUsingSupabaseLeads) {
+    if (!canChangeLeadStatus(lead)) {
+      showToast('You do not have permission to manage this lead.', 'error');
+      return;
+    }
+
+    var supabase = getSupabaseClient();
+    if (!supabase) {
+      showToast('Supabase is not available. Please refresh and try again.', 'error');
+      return;
+    }
+
+    try {
+      var statusPayload = {
+        status: mapStatusForDatabase(newStatus),
+        notes: composeNotesForStatus(lead.notes, newStatus)
+      };
+
+      var statusResult = await supabase
+        .from('leads')
+        .update(statusPayload)
+        .eq('id', id);
+
+      if (statusResult.error) throw statusResult.error;
+
+      if (leadCommunicationLogsAvailable) {
+        await createCommunicationLog(
+          lead,
+          'Status Change',
+          'Status changed from "' + lead.status + '" to "' + newStatus + '".',
+          '',
+          { silent: true }
+        );
+      }
+
+      await logActivity({
+        actionType: 'LEAD_STATUS_UPDATED',
+        description: 'Changed lead status to ' + newStatus + '.',
+        branchId: lead.branchId || null,
+        leadId: id
+      });
+
+      var shouldReopenPanel = sameId(activePanelId, id);
+      await reloadLeadsAfterWrite(shouldReopenPanel ? id : null);
+      showToast('Lead status updated.', 'success');
+    } catch (err) {
+      console.error('Lead status update failed:', err);
+      showToast('Could not update lead status. Please try again.', 'error');
+    }
+    return;
+  }
+
   var oldStatus = lead.status;
   lead.status = newStatus;
 
@@ -765,10 +1517,10 @@ function changeLeadStatus(id, newStatus) {
   });
 
   // If details panel is open for this lead, refresh it
-  if (activePanelId === id) openDetailsPanel(id);
+  if (sameId(activePanelId, id)) openDetailsPanel(id);
 
   renderAll();
-  showToast('Moved to ' + newStatus, 'success');
+  showToast(isUsingSupabaseLeads ? 'Status changed locally. Supabase updates come in Phase 4B.' : 'Moved to ' + newStatus, 'success');
 }
 
 
@@ -777,7 +1529,7 @@ function changeLeadStatus(id, newStatus) {
 ══════════════════════════════════════════════════════════════ */
 
 function openDetailsPanel(id) {
-  var lead = leads.find(function(l){ return l.id === id; });
+  var lead = leads.find(function(l){ return sameId(l.id, id); });
   if (!lead) return;
 
   activePanelId = id;
@@ -794,19 +1546,7 @@ function openDetailsPanel(id) {
     : '';
 
   // Build log HTML
-  var logHtml = lead.log.length === 0
-    ? '<p style="font-size:13px;color:var(--text-light);">No log entries yet.</p>'
-    : lead.log.map(function(entry) {
-        return [
-          '<div class="comm-entry">',
-            '<div class="comm-dot"></div>',
-            '<div class="comm-content">',
-              '<div class="comm-text">' + entry.text + '</div>',
-              '<div class="comm-time">' + entry.time + '</div>',
-            '</div>',
-          '</div>'
-        ].join('');
-      }).join('');
+  var logHtml = renderCommunicationLogEntries(lead.log);
 
   detailsBody.innerHTML = [
     // Status + source row
@@ -851,7 +1591,16 @@ function openDetailsPanel(id) {
       '<div class="details-section-title">Communication Log</div>',
       '<div class="comm-log" id="commLog">' + logHtml + '</div>',
       '<div class="add-log-wrap" style="margin-top:14px;">',
+        '<select class="log-input" id="logType" aria-label="Communication type">',
+          '<option value="Note">Note</option>',
+          '<option value="Call">Call</option>',
+          '<option value="WhatsApp">WhatsApp</option>',
+          '<option value="Email">Email</option>',
+          '<option value="Meeting">Meeting</option>',
+          '<option value="Follow-up">Follow-up</option>',
+        '</select>',
         '<input type="text" class="log-input" id="logInput" placeholder="Add a log entry… e.g. Called client at 14:00" />',
+        '<input type="date" class="log-input" id="logFollowupDate" aria-label="Follow-up date" />',
         '<button class="action-btn primary small" id="btnAddLog" data-leadid="' + lead.id + '">Add</button>',
       '</div>',
     '</div>',
@@ -886,7 +1635,7 @@ function openDetailsPanel(id) {
 }
 
 function buildQuickStatusButtons(lead) {
-  var statuses = ['New', 'Contacted', 'Follow-up', 'Viewing Scheduled', 'Offer Made', 'Closed Won', 'Closed Lost'];
+  var statuses = ['New', 'Contacted', 'Follow-up', 'Viewing Scheduled', 'Offer Made', 'Closed', 'Closed Won', 'Closed Lost'];
   return statuses.map(function(s) {
     var active = s === lead.status;
     return '<button class="action-btn ' + (active ? 'primary' : 'outline') + ' small" style="font-size:11px;padding:5px 11px;" ' +
@@ -897,7 +1646,7 @@ function buildQuickStatusButtons(lead) {
 
 detailsBody.addEventListener('click', function(e) {
   if (e.target.dataset.quickstatus) {
-    changeLeadStatus(parseInt(e.target.dataset.leadid), e.target.dataset.quickstatus);
+    changeLeadStatus(e.target.dataset.leadid, e.target.dataset.quickstatus);
   }
 });
 
@@ -917,38 +1666,52 @@ detailsClose.addEventListener('click', closeDetailsPanel);
 
 /* ══════════════════════════════════════════════════════════════
    18. COMMUNICATION LOG — ADD ENTRY
-   // Later: replace with Supabase insert into lead_log table.
+   Phase 4C will persist communication logs.
 ══════════════════════════════════════════════════════════════ */
 
-function addLogEntry(leadId) {
+async function addLogEntry(leadId) {
   var input  = document.getElementById('logInput');
+  var typeEl = document.getElementById('logType');
+  var followupEl = document.getElementById('logFollowupDate');
   var text   = input ? input.value.trim() : '';
   if (!text) { showToast('Please enter a log message', 'error'); return; }
 
-  var lead = leads.find(function(l){ return l.id === leadId; });
+  var lead = leads.find(function(l){ return sameId(l.id, leadId); });
   if (!lead) return;
 
-  lead.log.push({ text: text, time: nowTimestamp() });
+  var communicationType = typeEl ? typeEl.value : 'Note';
+  var followUpDate = followupEl ? followupEl.value : '';
+
+  if (isUsingSupabaseLeads) {
+    var saved = await createCommunicationLog(lead, communicationType, text, followUpDate);
+    if (!saved) return;
+
+    input.value = '';
+    if (followupEl) followupEl.value = '';
+    await reloadLeadsAfterWrite(lead.id);
+    showToast(followUpDate ? 'Follow-up saved.' : 'Communication log saved.', 'success');
+    return;
+  }
+
+  lead.log.push({
+    text: text,
+    time: nowTimestamp(),
+    type: communicationType,
+    staffName: currentStaffProfile ? currentStaffProfile.full_name : 'Demo user',
+    followupDate: followUpDate
+  });
+  if (followUpDate) lead.followupDate = followUpDate;
   input.value = '';
+  if (followupEl) followupEl.value = '';
 
   // Refresh log section in panel without full re-open
   var commLog = document.getElementById('commLog');
   if (commLog) {
-    commLog.innerHTML = lead.log.map(function(entry) {
-      return [
-        '<div class="comm-entry">',
-          '<div class="comm-dot"></div>',
-          '<div class="comm-content">',
-            '<div class="comm-text">' + entry.text + '</div>',
-            '<div class="comm-time">' + entry.time + '</div>',
-          '</div>',
-        '</div>'
-      ].join('');
-    }).join('');
+    commLog.innerHTML = renderCommunicationLogEntries(lead.log);
     commLog.lastElementChild.scrollIntoView({ behavior: 'smooth' });
   }
 
-  showToast('Log entry added', 'success');
+  showToast(followUpDate ? 'Follow-up saved.' : 'Communication log saved.', 'success');
 }
 
 
@@ -963,28 +1726,47 @@ function openLeadModal(mode, id) {
   switchModalTab('client');
 
   if (mode === 'edit' && id) {
-    var lead = leads.find(function(l){ return l.id === id; });
+    var lead = leads.find(function(l){ return sameId(l.id, id); });
     if (!lead) return;
+
+    if (isUsingSupabaseLeads && !canManageLead(lead)) {
+      showToast('You do not have permission to manage this lead.', 'error');
+      return;
+    }
 
     leadModalTitle.textContent = 'Edit Lead';
     editLeadIdField.value = lead.id;
+    populateLeadFormLookups(lead.branchId || '', lead.agentId || '');
 
     document.getElementById('fName').value         = lead.name;
     document.getElementById('fPhone').value        = lead.phone;
     document.getElementById('fEmail').value        = lead.email;
     document.getElementById('fProperty').value     = lead.property;
     document.getElementById('fSource').value       = lead.source;
-    document.getElementById('fBranch').value       = lead.branch;
-    document.getElementById('fAgent').value        = lead.agent;
+    document.getElementById('fBranch').value       = lead.branchId || lead.branch;
+    document.getElementById('fAgent').value        = lead.agentId || '';
     document.getElementById('fStatus').value       = lead.status;
     document.getElementById('fFollowupDate').value = lead.followupDate;
     document.getElementById('fFollowupNote').value = lead.followupNote;
     document.getElementById('fNotes').value        = lead.notes;
 
   } else {
+    var defaultBranchId = '';
+    if (isUsingSupabaseLeads) {
+      var visibleBranches = getVisibleBranchesForForm();
+      defaultBranchId = visibleBranches.length === 1 ? visibleBranches[0].id : '';
+
+      if (!canCreateLeadForBranch(defaultBranchId || (currentStaffProfile && currentStaffProfile.branch_id))) {
+        showToast('You do not have permission to manage this lead.', 'error');
+        return;
+      }
+    }
+
     leadModalTitle.textContent = 'Add New Lead';
     editLeadIdField.value = '';
+    populateLeadFormLookups(defaultBranchId, '');
     leadForm.reset();
+    if (defaultBranchId) document.getElementById('fBranch').value = defaultBranchId;
     // Set default date to today
     var today = new Date().toISOString().slice(0, 10);
     document.getElementById('fFollowupDate').value = today;
@@ -1045,18 +1827,24 @@ function switchModalTab(tabName) {
   });
 }
 
+var branchField = document.getElementById('fBranch');
+if (branchField) {
+  branchField.addEventListener('change', function() {
+    populateLeadFormLookups(branchField.value, '');
+  });
+}
+
 
 /* ══════════════════════════════════════════════════════════════
    20. FORM SAVE (ADD OR EDIT)
-   // Later: replace the array push/update with Supabase upsert:
-   // await supabase.from('leads').upsert(formData);
+   Phase 4B will persist lead create/update actions.
 ══════════════════════════════════════════════════════════════ */
 
-leadForm.addEventListener('submit', function(e) {
+leadForm.addEventListener('submit', async function(e) {
   e.preventDefault();
 
   // Validate required fields
-  var requiredFields = ['fName', 'fPhone', 'fSource', 'fBranch', 'fAgent', 'fStatus'];
+  var requiredFields = ['fName', 'fPhone', 'fSource', 'fBranch', 'fStatus'];
   var valid = true;
   requiredFields.forEach(function(fieldId) {
     var el = document.getElementById(fieldId);
@@ -1091,31 +1879,130 @@ leadForm.addEventListener('submit', function(e) {
 
   var editId = editLeadIdField.value;
 
+  if (isUsingSupabaseLeads) {
+    var payload = buildLeadPayloadFromForm(formData.status);
+
+    if (!payload.client_name || !payload.phone || !payload.source || !payload.branch_id || !payload.status) {
+      showToast('Please fill in all required fields', 'error');
+      return;
+    }
+
+    if (document.getElementById('fProperty').value.trim() && !payload.property_id) {
+      showToast('Select an existing property or leave the property field blank.', 'error');
+      return;
+    }
+
+    if (payload.assigned_agent_id) {
+      var selectedAgent = staffLookupById[String(payload.assigned_agent_id)];
+      if (selectedAgent && payload.branch_id && !sameId(selectedAgent.branch_id, payload.branch_id)) {
+        showToast('Assigned staff must belong to the selected branch.', 'error');
+        return;
+      }
+    }
+
+    var supabase = getSupabaseClient();
+    if (!supabase) {
+      showToast('Supabase is not available. Please refresh and try again.', 'error');
+      return;
+    }
+
+    try {
+      if (editId) {
+        var existingLead = leads.find(function(l){ return sameId(l.id, editId); });
+        if (!existingLead) return;
+        if (!canManageLead(existingLead)) {
+          showToast('You do not have permission to manage this lead.', 'error');
+          return;
+        }
+
+        var updateResult = await supabase
+          .from('leads')
+          .update(payload)
+          .eq('id', editId);
+
+        if (updateResult.error) throw updateResult.error;
+
+        var assignedAgentChanged = !sameId(existingLead.agentId || '', payload.assigned_agent_id || '');
+        var statusChanged = mapStatusForDatabase(existingLead.status) !== payload.status;
+        var updatedAgent = payload.assigned_agent_id ? staffLookupById[String(payload.assigned_agent_id)] : null;
+        var activityType = statusChanged
+          ? 'LEAD_STATUS_UPDATED'
+          : (assignedAgentChanged ? 'LEAD_ASSIGNED' : 'LEAD_UPDATED');
+        var activityDescription = statusChanged
+          ? 'Changed lead status to ' + formData.status + '.'
+          : (assignedAgentChanged
+              ? 'Assigned lead to ' + (updatedAgent ? updatedAgent.full_name : 'Unassigned') + '.'
+              : 'Updated lead for ' + payload.client_name + '.');
+        await logActivity({
+          actionType: activityType,
+          description: activityDescription,
+          branchId: payload.branch_id || existingLead.branchId || null,
+          leadId: editId
+        });
+
+        closeLeadModal();
+        await reloadLeadsAfterWrite(sameId(activePanelId, editId) ? editId : null);
+        showToast('Lead updated successfully.', 'success');
+      } else {
+        if (!canCreateLeadForBranch(payload.branch_id)) {
+          showToast('You do not have permission to manage this lead.', 'error');
+          return;
+        }
+
+        var insertResult = await supabase
+          .from('leads')
+          .insert(payload)
+          .select('id')
+          .single();
+
+        if (insertResult.error) throw insertResult.error;
+
+        await logActivity({
+          actionType: 'LEAD_CREATED',
+          description: 'Created lead for ' + payload.client_name + '.',
+          branchId: payload.branch_id || null,
+          leadId: insertResult.data ? insertResult.data.id : null
+        });
+
+        closeLeadModal();
+        await reloadLeadsAfterWrite();
+        showToast('Lead created successfully.', 'success');
+      }
+    } catch (err) {
+      console.error('Lead save failed:', err);
+      showToast('Could not save lead. Please check the fields and try again.', 'error');
+    }
+    return;
+  }
+
   if (editId) {
     // EDIT existing lead
-    var idx = leads.findIndex(function(l){ return l.id === parseInt(editId); });
+    var idx = leads.findIndex(function(l){ return sameId(l.id, editId); });
     if (idx > -1) {
       var existingLog = leads[idx].log || [];
-      formData.id  = parseInt(editId);
+      formData.id  = editId;
+      formData.propertyId = leads[idx].propertyId || null;
+      formData.branchId = leads[idx].branchId || null;
+      formData.agentId = leads[idx].agentId || null;
       formData.dateEnquiry = leads[idx].dateEnquiry;
       formData.log = existingLog;
       // Log the edit
       formData.log.push({ text: 'Lead details updated.', time: nowTimestamp() });
       leads[idx] = formData;
-      showToast('Lead updated successfully', 'success');
+      showToast(isUsingSupabaseLeads ? 'Lead updated locally. Supabase save comes in Phase 4B.' : 'Lead updated successfully', 'success');
     }
   } else {
     // ADD new lead
     formData.id  = nextLeadId++;
     formData.log = [{ text: 'Lead created.', time: nowTimestamp() }];
     leads.push(formData);
-    showToast('Lead added successfully', 'success');
+    showToast(isUsingSupabaseLeads ? 'Lead added locally. Supabase create comes in Phase 4B.' : 'Lead added successfully', 'success');
   }
 
   closeLeadModal();
   // If panel was open for the edited lead, refresh it
-  if (editId && activePanelId === parseInt(editId)) {
-    openDetailsPanel(parseInt(editId));
+  if (editId && sameId(activePanelId, editId)) {
+    openDetailsPanel(editId);
   }
   renderAll();
 });
@@ -1172,4 +2059,4 @@ function showToast(message, type) {
    23. INITIAL RENDER
 ══════════════════════════════════════════════════════════════ */
 
-renderAll();
+loadLeadModuleData();
