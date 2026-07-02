@@ -612,7 +612,6 @@ function configureWhyHeroVideo() {
 }
 
 function renderHero() {
-  if (!byId('heroTitle') || !byId('heroSubtitle') || !byId('heroButton')) return;
   var homepage = publicState.homepage || {};
   var banner = publicState.banners.length ? publicState.banners[0] : null;
   var title = homepage.hero_title || (banner && banner.title) || 'Find Verified Properties Across Zambia';
@@ -620,10 +619,16 @@ function renderHero() {
   var buttonText = homepage.hero_button_text || (banner && banner.button_text) || 'View Listings';
   var buttonLink = homepage.hero_button_link || (banner && banner.button_link) || 'listings.html';
 
-  byId('heroTitle').textContent = title;
-  byId('heroSubtitle').textContent = subtitle;
-  byId('heroButton').textContent = buttonText;
-  byId('heroButton').setAttribute('href', buttonLink || '#properties');
+  var titleEl = byId('heroTitle');
+  var subtitleEl = byId('heroSubtitle');
+  var buttonEl = byId('heroButton');
+
+  if (titleEl) titleEl.textContent = title;
+  if (subtitleEl) subtitleEl.textContent = subtitle;
+  if (buttonEl) {
+    buttonEl.textContent = buttonText;
+    buttonEl.setAttribute('href', buttonLink || '#properties');
+  }
 
   var heroMedia = byId('heroMedia');
   var imageUrl = banner && banner.image_url;

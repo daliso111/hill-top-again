@@ -613,6 +613,8 @@ function bindEvents() {
     byId('siteNav').classList.toggle('open');
   });
 
+  var headerEnq = byId('headerEnquiryButton');
+  if (headerEnq) headerEnq.addEventListener('click', openEnquiryModal);
   byId('detailsEnquiryButton').addEventListener('click', openEnquiryModal);
   byId('enquiryForm').addEventListener('submit', submitEnquiry);
   byId('enquiryModalClose').addEventListener('click', closeEnquiryModal);
